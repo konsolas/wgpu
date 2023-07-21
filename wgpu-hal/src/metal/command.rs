@@ -1,4 +1,5 @@
 use super::{conv, AsNative};
+use metal::MTLRenderStages;
 use std::{borrow::Cow, mem, ops::Range};
 
 // has to match `Temp::binding_sizes`
@@ -952,6 +953,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                 encoder.set_buffer(1, Some(&buffer.raw), offset);
                 encoder.set_buffer(2, Some(&icb_container), 0);
                 encoder.set_buffer(3, Some(&count_buffer.raw), count_offset);
+                encoder.use_resource(&icb, metal::MTLResourceUsage::Write);
                 encoder.dispatch_threads(
                     metal::MTLSize::new(max_count as _, 1, 1),
                     metal::MTLSize::new(shader.pso.max_total_threads_per_threadgroup(), 1, 1),
@@ -1006,6 +1008,7 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
                     Some(&index_state.buffer_ptr.as_native()),
                     index_state.offset,
                 );
+                encoder.use_resource(&icb, metal::MTLResourceUsage::Write);
                 encoder.dispatch_threads(
                     metal::MTLSize::new(max_count as _, 1, 1),
                     metal::MTLSize::new(shader.pso.max_total_threads_per_threadgroup(), 1, 1),
@@ -1020,7 +1023,12 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
             }
 
             let render_encoder = self.state.render.as_ref().unwrap();
-            render_encoder.execute_commands_in_buffer(&icb, icb_range)
+            render_encoder.use_resource_at(
+                &index_state.buffer_ptr.as_native(),
+                metal::MTLResourceUsage::Read,
+                MTLRenderStages::Vertex,
+            );
+            render_encoder.execute_commands_in_buffer(&icb, icb_range);
         });
     }
 
