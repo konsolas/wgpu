@@ -253,11 +253,33 @@ struct Settings {
     retain_command_buffer_references: bool,
 }
 
+struct FunctionPsoPair {
+    function: metal::Function,
+    pso: metal::ComputePipelineState,
+}
+
+impl FunctionPsoPair {
+    fn new(device: &metal::DeviceRef, library: &metal::LibraryRef, entry: &str) -> FunctionPsoPair {
+        let function = library.get_function(entry, None).unwrap();
+        let pso = device
+            .new_compute_pipeline_state_with_function(&function)
+            .unwrap();
+        FunctionPsoPair { function, pso }
+    }
+}
+
+struct MultiDrawShaders {
+    to_icb_unindexed: FunctionPsoPair,
+    to_icb_indexed_u16: FunctionPsoPair,
+    to_icb_indexed_u32: FunctionPsoPair,
+}
+
 struct AdapterShared {
     device: Mutex<metal::Device>,
     disabilities: PrivateDisabilities,
     private_caps: PrivateCapabilities,
     settings: Settings,
+    multi_draw_shaders: MultiDrawShaders,
     presentation_timer: time::PresentationTimer,
 }
 
@@ -269,11 +291,35 @@ impl AdapterShared {
         let private_caps = PrivateCapabilities::new(&device);
         log::debug!("{:#?}", private_caps);
 
+        let options = metal::CompileOptions::new();
+        let multi_draw_library = device
+            .new_library_with_source(include_str!("shaders/multi_draw.metal"), &options)
+            .unwrap();
+
+        let internal_shaders = MultiDrawShaders {
+            to_icb_unindexed: FunctionPsoPair::new(
+                &device,
+                &multi_draw_library,
+                "to_icb_unindexed",
+            ),
+            to_icb_indexed_u16: FunctionPsoPair::new(
+                &device,
+                &multi_draw_library,
+                "to_icb_indexed_u16",
+            ),
+            to_icb_indexed_u32: FunctionPsoPair::new(
+                &device,
+                &multi_draw_library,
+                "to_icb_indexed_u32",
+            ),
+        };
+
         Self {
             disabilities: PrivateDisabilities::new(&device),
             private_caps,
             device: Mutex::new(device),
             settings: Settings::default(),
+            multi_draw_shaders: internal_shaders,
             presentation_timer: time::PresentationTimer::new(),
         }
     }

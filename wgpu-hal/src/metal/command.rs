@@ -55,6 +55,44 @@ impl super::CommandEncoder {
         self.state.reset();
         self.leave_blit();
     }
+
+    fn make_internal_icb(
+        &self,
+        command_type: metal::MTLIndirectCommandType,
+        max_count: u32,
+    ) -> metal::IndirectCommandBuffer {
+        let icb_desc = metal::IndirectCommandBufferDescriptor::new();
+        icb_desc.set_command_types(command_type);
+        icb_desc.set_inherit_buffers(true);
+        icb_desc.set_inherit_pipeline_state(true);
+        icb_desc.set_max_vertex_buffer_bind_count(0);
+        icb_desc.set_max_fragment_buffer_bind_count(0);
+
+        self.shared
+            .device
+            .lock()
+            .new_indirect_command_buffer_with_descriptor(
+                &icb_desc,
+                max_count as _,
+                metal::MTLResourceOptions::StorageModePrivate,
+            )
+    }
+
+    fn make_icb_container(
+        &self,
+        icb: &metal::IndirectCommandBufferRef,
+        function: &metal::FunctionRef,
+        index: u32,
+    ) -> metal::Buffer {
+        let arg_encoder = function.new_argument_encoder(index as _);
+        let container = self.shared.device.lock().new_buffer(
+            arg_encoder.encoded_length(),
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        arg_encoder.set_argument_buffer(&container, 0);
+        arg_encoder.set_indirect_command_buffer(0, icb);
+        container
+    }
 }
 
 impl super::CommandState {
@@ -889,23 +927,101 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
 
     unsafe fn draw_indirect_count(
         &mut self,
-        _buffer: &super::Buffer,
-        _offset: wgt::BufferAddress,
-        _count_buffer: &super::Buffer,
-        _count_offset: wgt::BufferAddress,
-        _max_count: u32,
+        buffer: &super::Buffer,
+        offset: wgt::BufferAddress,
+        count_buffer: &super::Buffer,
+        count_offset: wgt::BufferAddress,
+        max_count: u32,
     ) {
-        //TODO
+        objc::rc::autoreleasepool(|| {
+            let icb = self.make_internal_icb(metal::MTLIndirectCommandType::Draw, max_count);
+            let icb_range = metal::NSRange {
+                location: 0,
+                length: max_count as _,
+            };
+            let shader = &self.shared.multi_draw_shaders.to_icb_unindexed;
+            let icb_container = self.make_icb_container(&icb, &shader.function, 2);
+            let prim_type = self.state.raw_primitive_type as u32;
+            let prim_type_ptr: *const u32 = &prim_type;
+
+            let cmd_buf = self.raw_cmd_buf.as_ref().unwrap();
+            {
+                let encoder = cmd_buf.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&shader.pso);
+                encoder.set_bytes(0, 4, prim_type_ptr as *const std::ffi::c_void);
+                encoder.set_buffer(1, Some(&buffer.raw), offset);
+                encoder.set_buffer(2, Some(&icb_container), 0);
+                encoder.set_buffer(3, Some(&count_buffer.raw), count_offset);
+                encoder.dispatch_threads(
+                    metal::MTLSize::new(max_count as _, 1, 1),
+                    metal::MTLSize::new(shader.pso.max_total_threads_per_threadgroup(), 1, 1),
+                );
+                encoder.end_encoding();
+            }
+
+            {
+                let encoder = cmd_buf.new_blit_command_encoder();
+                encoder.optimize_indirect_command_buffer(&icb, icb_range);
+                encoder.end_encoding();
+            }
+
+            let render_encoder = &self.state.render.as_ref().unwrap();
+            render_encoder.execute_commands_in_buffer(&icb, icb_range)
+        });
     }
+
     unsafe fn draw_indexed_indirect_count(
         &mut self,
-        _buffer: &super::Buffer,
-        _offset: wgt::BufferAddress,
-        _count_buffer: &super::Buffer,
-        _count_offset: wgt::BufferAddress,
-        _max_count: u32,
+        buffer: &super::Buffer,
+        offset: wgt::BufferAddress,
+        count_buffer: &super::Buffer,
+        count_offset: wgt::BufferAddress,
+        max_count: u32,
     ) {
-        //TODO
+        objc::rc::autoreleasepool(|| {
+            let icb = self.make_internal_icb(metal::MTLIndirectCommandType::DrawIndexed, max_count);
+            let icb_range = metal::NSRange {
+                location: 0,
+                length: max_count as _,
+            };
+            let index_state = self.state.index.as_ref().unwrap();
+            let shader = match index_state.raw_type {
+                metal::MTLIndexType::UInt16 => &self.shared.multi_draw_shaders.to_icb_indexed_u16,
+                metal::MTLIndexType::UInt32 => &self.shared.multi_draw_shaders.to_icb_indexed_u32,
+            };
+            let icb_container = self.make_icb_container(&icb, &shader.function, 2);
+            let prim_type = self.state.raw_primitive_type as u32;
+            let prim_type_ptr: *const u32 = &prim_type;
+
+            let cmd_buf = self.raw_cmd_buf.as_ref().unwrap();
+            {
+                let encoder = cmd_buf.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&shader.pso);
+                encoder.set_bytes(0, 4, prim_type_ptr as *const std::ffi::c_void);
+                encoder.set_buffer(1, Some(&buffer.raw), offset);
+                encoder.set_buffer(2, Some(&icb_container), 0);
+                encoder.set_buffer(3, Some(&count_buffer.raw), count_offset);
+                encoder.set_buffer(
+                    4,
+                    Some(&index_state.buffer_ptr.as_native()),
+                    index_state.offset,
+                );
+                encoder.dispatch_threads(
+                    metal::MTLSize::new(max_count as _, 1, 1),
+                    metal::MTLSize::new(shader.pso.max_total_threads_per_threadgroup(), 1, 1),
+                );
+                encoder.end_encoding();
+            }
+
+            {
+                let encoder = cmd_buf.new_blit_command_encoder();
+                encoder.optimize_indirect_command_buffer(&icb, icb_range);
+                encoder.end_encoding();
+            }
+
+            let render_encoder = self.state.render.as_ref().unwrap();
+            render_encoder.execute_commands_in_buffer(&icb, icb_range)
+        });
     }
 
     // compute
